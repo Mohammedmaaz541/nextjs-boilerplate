@@ -1,0 +1,647 @@
+// ============================================================
+// Prisma Schema — Travel & Visa Services Platform
+// Provider  : MongoDB (Atlas)
+// Generator : prisma-client (Prisma v6+)
+// SDD Ref   : docs/SDD.md — Section 3 (Database Design)
+// ============================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "mongodb"
+}
+
+// ─────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  VENDOR
+  AGENCY_OWNER
+  AGENCY_STAFF
+}
+
+enum VendorCategory {
+  UMRAH
+  VISA
+  ATTESTATION
+  HOTEL
+  TRANSPORT
+}
+
+enum KycStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum ListingStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+enum EnquiryStatus {
+  OPEN
+  DRAFT_CREATED
+  QUOTED
+  CONVERTED
+  LOST
+}
+
+enum DraftPackageStatus {
+  DRAFT
+  SENT
+  EXPIRED
+  CONVERTED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum BookingPipelineStage {
+  ENQUIRY
+  BOOKING_CREATED
+  DOCS_SUBMITTED
+  PROCESSING
+  COMPLETED
+}
+
+enum CustomerPipelineStage {
+  LEAD
+  ENQUIRY
+  BOOKING
+  PROCESSING
+  COMPLETED
+}
+
+enum WalletTransactionType {
+  CREDIT
+  DEBIT
+  ESCROW_HOLD
+  ESCROW_RELEASE
+  REFUND
+  COMMISSION
+}
+
+enum WalletTransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+enum EscrowStatus {
+  HELD
+  RELEASED
+  REFUNDED
+  DISPUTED
+}
+
+enum DocumentReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum InvoiceType {
+  BOOKING
+  WALLET_RECHARGE
+  COMMISSION
+  REFUND
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  VOID
+}
+
+enum NotificationType {
+  BOOKING
+  DOCUMENT
+  PAYMENT
+  STATUS_CHANGE
+  SYSTEM
+}
+
+enum NotificationChannel {
+  IN_APP
+  WHATSAPP
+  EMAIL
+}
+
+enum NotificationDeliveryStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+}
+
+// ─────────────────────────────────────────
+// COMPOSITE TYPES  (embedded documents)
+// ─────────────────────────────────────────
+
+/// Structured address embedded in Vendor
+type Address {
+  street  String?
+  city    String?
+  country String?
+}
+
+/// Single KYC document reference stored in Vendor.kycDocuments
+type KycDocument {
+  key        String
+  type       String
+  uploadedAt DateTime
+}
+
+/// Required-document descriptor stored in ServiceListing.requiredDocuments
+type RequiredDocument {
+  name        String
+  mandatory   Boolean
+  description String?
+}
+
+/// Line item inside DraftPackage.items
+type PackageItem {
+  listingId     String
+  qty           Int
+  vendorPrice   Float
+  agencyMargin  Float
+  totalPrice    Float
+}
+
+/// Line item inside Invoice.lineItems
+type InvoiceLineItem {
+  description String
+  qty         Int
+  unitPrice   Float
+  total       Float
+}
+
+// ─────────────────────────────────────────
+// 3.1  USER MODEL
+// Central identity — shared across all roles
+// ─────────────────────────────────────────
+
+model User {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  email           String    @unique
+  passwordHash    String
+  role            Role
+  firstName       String
+  lastName        String
+  phone           String?
+  isActive        Boolean   @default(true)
+  isEmailVerified Boolean   @default(false)
+
+  /// FK → Vendor (nullable; set when role = VENDOR)
+  vendorId        String?   @db.ObjectId
+  vendor          Vendor?   @relation(fields: [vendorId], references: [id])
+
+  /// FK → Agency (nullable; set when role = AGENCY_*)
+  agencyId        String?   @db.ObjectId
+  agency          Agency?   @relation(fields: [agencyId], references: [id])
+
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // Back-relations
+  notifications   Notification[]
+  auditLogs       AuditLog[]
+  approvedListings ServiceListing[] @relation("ListingApprovedBy")
+  releasedEscrows  EscrowLedger[]   @relation("EscrowReleasedBy")
+  reviewedDocuments Document[]      @relation("DocumentReviewedBy")
+  createdEnquiries  Enquiry[]       @relation("EnquiryCreatedBy")
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────
+// 3.2  VENDOR MODEL
+// ─────────────────────────────────────────
+
+model Vendor {
+  id             String           @id @default(auto()) @map("_id") @db.ObjectId
+  businessName   String
+  slug           String           @unique
+  category       VendorCategory[]
+  kycStatus      KycStatus        @default(PENDING)
+  kycDocuments   KycDocument[]    /// Embedded array of S3 document refs
+  contactEmail   String
+  contactPhone   String
+  address        Address?         /// Embedded structured address
+  bankDetails    Json?            /// AES-encrypted bank account details
+  isActive       Boolean          @default(false)
+  rating         Float            @default(0)
+  slaBreachCount Int              @default(0)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  // Back-relations
+  users          User[]
+  listings       ServiceListing[]
+  bookings       Booking[]
+  escrows        EscrowLedger[]
+
+  @@map("vendors")
+}
+
+// ─────────────────────────────────────────
+// 3.3  AGENCY MODEL
+// ─────────────────────────────────────────
+
+model Agency {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  businessName   String
+  slug           String   @unique
+  licenseNumber  String?  @unique
+  contactEmail   String
+  contactPhone   String
+  walletBalance  Float    @default(0)
+  creditLimit    Float    @default(0)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Back-relations
+  users          User[]
+  customers      Customer[]
+  enquiries      Enquiry[]
+  draftPackages  DraftPackage[]
+  bookings       Booking[]
+  transactions   WalletTransaction[]
+  escrows        EscrowLedger[]
+  documents      Document[]
+  invoices       Invoice[]
+
+  @@map("agencies")
+}
+
+// ─────────────────────────────────────────
+// 3.4  SERVICE LISTING MODEL
+// ─────────────────────────────────────────
+
+model ServiceListing {
+  id                  String            @id @default(auto()) @map("_id") @db.ObjectId
+  vendorId            String            @db.ObjectId
+  vendor              Vendor            @relation(fields: [vendorId], references: [id])
+  category            VendorCategory
+  title               String
+  description         String?
+  destinationCountry  String            /// ISO-3166-1 alpha-2
+  inclusions          String[]
+  requiredDocuments   RequiredDocument[] /// Embedded checklist
+  basePrice           Float
+  currency            String            @default("USD")
+  slaDays             Int
+  status              ListingStatus     @default(DRAFT)
+
+  /// FK → User (Admin who approved)
+  approvedBy          String?           @db.ObjectId
+  approvedByUser      User?             @relation("ListingApprovedBy", fields: [approvedBy], references: [id])
+  approvedAt          DateTime?
+
+  inventoryCount      Int?
+  tags                String[]
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  // Back-relations
+  bookings            Booking[]
+
+  @@index([vendorId])
+  @@index([category, status])
+  @@index([destinationCountry])
+  @@map("service_listings")
+}
+
+// ─────────────────────────────────────────
+// 3.5  ENQUIRY MODEL
+// ─────────────────────────────────────────
+
+model Enquiry {
+  id         String        @id @default(auto()) @map("_id") @db.ObjectId
+  agencyId   String        @db.ObjectId
+  agency     Agency        @relation(fields: [agencyId], references: [id])
+
+  customerId String?       @db.ObjectId
+  customer   Customer?     @relation(fields: [customerId], references: [id])
+
+  title      String
+  status     EnquiryStatus @default(OPEN)
+  notes      String?
+
+  createdBy  String        @db.ObjectId
+  creator    User          @relation("EnquiryCreatedBy", fields: [createdBy], references: [id])
+
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  // Back-relations
+  drafts     DraftPackage[]
+
+  @@index([agencyId, status])
+  @@map("enquiries")
+}
+
+// ─────────────────────────────────────────
+// 3.6  DRAFT PACKAGE MODEL
+// ─────────────────────────────────────────
+
+model DraftPackage {
+  id               String             @id @default(auto()) @map("_id") @db.ObjectId
+  enquiryId        String             @db.ObjectId
+  enquiry          Enquiry            @relation(fields: [enquiryId], references: [id])
+
+  agencyId         String             @db.ObjectId
+  agency           Agency             @relation(fields: [agencyId], references: [id])
+
+  version          Int                @default(1)
+  title            String
+  items            PackageItem[]      /// Embedded line items with margins
+  subtotal         Float              @default(0)  /// Sum of vendor prices
+  marginTotal      Float              @default(0)  /// Sum of agency margins
+  grandTotal       Float              @default(0)  /// subtotal + marginTotal
+
+  quotationPdfKey  String?            /// S3 object key for generated PDF
+  whatsappSent     Boolean            @default(false)
+  expiresAt        DateTime?
+  status           DraftPackageStatus @default(DRAFT)
+
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  // Back-relations
+  bookings         Booking[]
+
+  @@index([enquiryId])
+  @@index([agencyId, status])
+  @@map("draft_packages")
+}
+
+// ─────────────────────────────────────────
+// 3.7  BOOKING MODEL
+// ─────────────────────────────────────────
+
+model Booking {
+  id                  String               @id @default(auto()) @map("_id") @db.ObjectId
+  bookingRef          String               @unique /// e.g. BK-2024-00123
+  agencyId            String               @db.ObjectId
+  agency              Agency               @relation(fields: [agencyId], references: [id])
+
+  customerId          String               @db.ObjectId
+  customer            Customer             @relation(fields: [customerId], references: [id])
+
+  draftPackageId      String?              @db.ObjectId
+  draftPackage        DraftPackage?        @relation(fields: [draftPackageId], references: [id])
+
+  listingId           String               @db.ObjectId
+  listing             ServiceListing       @relation(fields: [listingId], references: [id])
+
+  vendorId            String               @db.ObjectId
+  vendor              Vendor               @relation(fields: [vendorId], references: [id])
+
+  quantity            Int
+  vendorPrice         Float
+  agencyMargin        Float
+  platformCommission  Float
+  totalAmount         Float
+  escrowAmount        Float
+
+  status              BookingStatus        @default(PENDING)
+  pipelineStage       BookingPipelineStage @default(ENQUIRY)
+  notes               String?
+
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  // Back-relations
+  escrow              EscrowLedger?
+  documents           Document[]
+  invoices            Invoice[]
+
+  @@index([agencyId, status])
+  @@index([vendorId, status])
+  @@index([customerId])
+  @@map("bookings")
+}
+
+// ─────────────────────────────────────────
+// 3.8  CUSTOMER MODEL  (CRM)
+// ─────────────────────────────────────────
+
+model Customer {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  agencyId        String                @db.ObjectId
+  agency          Agency                @relation(fields: [agencyId], references: [id])
+
+  firstName       String
+  lastName        String
+  email           String?
+  phone           String
+  nationality     String?               /// ISO-3166-1 alpha-2
+  passportNumber  String?               /// AES-256 encrypted at rest
+  passportExpiry  DateTime?
+  dateOfBirth     DateTime?
+  tags            String[]
+  pipelineStage   CustomerPipelineStage @default(LEAD)
+
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  // Back-relations
+  enquiries       Enquiry[]
+  bookings        Booking[]
+  documents       Document[]
+
+  @@index([agencyId, pipelineStage])
+  @@map("customers")
+}
+
+// ─────────────────────────────────────────
+// 3.9  WALLET TRANSACTION MODEL
+// ─────────────────────────────────────────
+
+model WalletTransaction {
+  id             String                  @id @default(auto()) @map("_id") @db.ObjectId
+  agencyId       String                  @db.ObjectId
+  agency         Agency                  @relation(fields: [agencyId], references: [id])
+
+  type           WalletTransactionType
+  amount         Float                   /// Always positive; direction determined by type
+  balanceBefore  Float
+  balanceAfter   Float
+  referenceType  String?                 /// "Booking" | "Recharge" | "Refund" (polymorphic label)
+  referenceId    String?                 @db.ObjectId /// Linked booking or recharge ObjectId
+  description    String
+  status         WalletTransactionStatus @default(PENDING)
+
+  createdAt      DateTime                @default(now())
+
+  @@index([agencyId, createdAt])
+  @@index([referenceId])
+  @@map("wallet_transactions")
+}
+
+// ─────────────────────────────────────────
+// 3.10  ESCROW LEDGER MODEL
+// ─────────────────────────────────────────
+
+model EscrowLedger {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+
+  bookingId   String       @unique @db.ObjectId /// One escrow record per booking
+  booking     Booking      @relation(fields: [bookingId], references: [id])
+
+  agencyId    String       @db.ObjectId
+  agency      Agency       @relation(fields: [agencyId], references: [id])
+
+  vendorId    String       @db.ObjectId
+  vendor      Vendor       @relation(fields: [vendorId], references: [id])
+
+  amount      Float
+  commission  Float        /// Platform commission deducted on release
+  status      EscrowStatus @default(HELD)
+  heldAt      DateTime
+  releasedAt  DateTime?
+
+  releasedBy  String?      @db.ObjectId
+  releasedByUser User?     @relation("EscrowReleasedBy", fields: [releasedBy], references: [id])
+
+  @@index([agencyId, status])
+  @@index([vendorId, status])
+  @@map("escrow_ledger")
+}
+
+// ─────────────────────────────────────────
+// 3.11  DOCUMENT MODEL
+// ─────────────────────────────────────────
+
+model Document {
+  id             String               @id @default(auto()) @map("_id") @db.ObjectId
+  bookingId      String               @db.ObjectId
+  booking        Booking              @relation(fields: [bookingId], references: [id])
+
+  customerId     String               @db.ObjectId
+  customer       Customer             @relation(fields: [customerId], references: [id])
+
+  agencyId       String               @db.ObjectId
+  agency         Agency               @relation(fields: [agencyId], references: [id])
+
+  type           String               /// PASSPORT | VISA | NID | PHOTO | OTHER
+  name           String
+  s3Key          String               @unique
+  s3Bucket       String
+  mimeType       String
+  fileSizeBytes  Int
+  reviewStatus   DocumentReviewStatus @default(PENDING)
+
+  reviewedBy     String?              @db.ObjectId
+  reviewedByUser User?                @relation("DocumentReviewedBy", fields: [reviewedBy], references: [id])
+  reviewNote     String?
+
+  uploadedAt     DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  @@index([bookingId])
+  @@index([customerId])
+  @@index([agencyId, reviewStatus])
+  @@map("documents")
+}
+
+// ─────────────────────────────────────────
+// 3.12  INVOICE MODEL
+// ─────────────────────────────────────────
+
+model Invoice {
+  id            String        @id @default(auto()) @map("_id") @db.ObjectId
+  invoiceNumber String        @unique /// e.g. INV-2024-00456
+  agencyId      String        @db.ObjectId
+  agency        Agency        @relation(fields: [agencyId], references: [id])
+
+  bookingId     String?       @db.ObjectId
+  booking       Booking?      @relation(fields: [bookingId], references: [id])
+
+  type          InvoiceType
+  lineItems     InvoiceLineItem[] /// Embedded line items
+  subtotal      Float
+  taxAmount     Float         @default(0)
+  totalAmount   Float
+  status        InvoiceStatus @default(DRAFT)
+  s3Key         String?       /// S3 key for generated PDF
+  issuedAt      DateTime?
+  dueAt         DateTime?
+
+  createdAt     DateTime      @default(now())
+
+  @@index([agencyId, status])
+  @@index([bookingId])
+  @@map("invoices")
+}
+
+// ─────────────────────────────────────────
+// 3.13  NOTIFICATION MODEL
+// ─────────────────────────────────────────
+
+model Notification {
+  id             String                     @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String                     @db.ObjectId
+  user           User                       @relation(fields: [userId], references: [id])
+
+  type           NotificationType
+  channel        NotificationChannel
+  title          String
+  message        String
+  referenceId    String?                    @db.ObjectId /// Polymorphic link (bookingId etc.)
+  isRead         Boolean                    @default(false)
+  deliveryStatus NotificationDeliveryStatus @default(PENDING)
+
+  createdAt      DateTime                   @default(now())
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// ─────────────────────────────────────────
+// 3.14  AUDIT LOG MODEL
+// ─────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @db.ObjectId
+  user       User     @relation(fields: [userId], references: [id])
+
+  action     String   /// e.g. BOOKING_CREATED, STATUS_UPDATED
+  entityType String   /// Affected model name: Booking, Document, etc.
+  entityId   String   @db.ObjectId
+  oldValue   Json?    /// Previous state snapshot
+  newValue   Json?    /// New state snapshot
+  ipAddress  String?
+  userAgent  String?
+
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@map("audit_logs")
+}
